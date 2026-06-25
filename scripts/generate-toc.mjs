@@ -30,33 +30,6 @@ function collectFiles(dir) {
   return results;
 }
 
-// ── 메타 파싱 ──────────────────────────────────────────────
-// "- **카테고리**: JavaScript" 같은 라인에서 값 추출
-function parseMeta(lines) {
-  const meta = {};
-  for (const line of lines) {
-    // 굵은 글씨(**key**) 뒤 콜론+값 패턴
-    const m = line.match(/^-\s+\*\*(.+?)\*\*:\s*(.+)$/);
-    if (m) {
-      const key = m[1].trim();
-      const val = m[2].trim();
-      if (key === '카테고리') meta.category = val;
-    }
-  }
-  return meta;
-}
-
-// ── GitHub anchor 생성 ─────────────────────────────────────
-// GitHub 규칙: 소문자화, 공백→하이픈, 특수문자(?!.,()'"`) 제거
-function toAnchor(title) {
-  return title
-    .toLowerCase()
-    .replace(/[?!.,()'"`]/g, '')  // 특수문자 제거
-    .replace(/\s+/g, '-')          // 공백 → 하이픈
-    .replace(/-+/g, '-')           // 연속 하이픈 정리
-    .replace(/^-|-$/g, '');        // 양 끝 하이픈 제거
-}
-
 // ── 질문 제목 정규화 (중복 판별용) ─────────────────────────
 // 소문자화 + 공백/문장부호 전부 제거해서 동일 질문 그룹핑
 function normalize(title) {
@@ -65,103 +38,117 @@ function normalize(title) {
     .replace(/[\s?!.,()'"`\-]/g, '');
 }
 
+// ── 질문 파싱 ──────────────────────────────────────────────
+// 각 ## 질문에서 카테고리, 답변, 꼬리질문 본문을 통째로 추출
+function parseQuestions(filePath) {
+  const content = readFileSync(filePath, 'utf-8');
+  const lines = content.split('\n');
+
+  // ## 헤더 위치 찾기
+  const h2Indices = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^## /.test(lines[i])) h2Indices.push(i);
+  }
+
+  const questions = [];
+
+  for (let qi = 0; qi < h2Indices.length; qi++) {
+    const idx = h2Indices[qi];
+    const title = lines[idx].replace(/^## /, '').trim();
+
+    // 이 질문의 범위: 현재 ## ~ 다음 ## (또는 파일 끝)
+    const endIdx = qi + 1 < h2Indices.length ? h2Indices[qi + 1] : lines.length;
+    const section = lines.slice(idx + 1, endIdx);
+
+    // 카테고리 파싱 (첫 줄에서)
+    let category = '기타';
+    if (section.length > 0) {
+      const m = section[0].match(/^-\s+\*\*카테고리\*\*:\s*(.+)$/);
+      if (m) category = m[1].trim();
+    }
+
+    // 답변 + 꼬리질문 본문 추출 (카테고리 라인 이후 전체)
+    // --- 구분자와 빈 줄 트림
+    let bodyLines = section.slice(1); // 카테고리 라인 제외
+
+    // 끝에서 --- 구분자와 빈 줄 제거
+    while (bodyLines.length > 0) {
+      const last = bodyLines[bodyLines.length - 1].trim();
+      if (last === '' || last === '---') bodyLines.pop();
+      else break;
+    }
+
+    // 앞쪽 빈 줄 제거
+    while (bodyLines.length > 0 && bodyLines[0].trim() === '') {
+      bodyLines.shift();
+    }
+
+    const body = bodyLines.join('\n');
+
+    questions.push({ title, category, body });
+  }
+
+  return questions;
+}
+
 // ── 메인 로직 ──────────────────────────────────────────────
 function main() {
   const files = collectFiles(WEEKS_DIR);
-  const questions = []; // { title, category, author, week, filePath, anchor }
+  const allQuestions = []; // { title, category, body }
 
   for (const filePath of files) {
-    const relPath = relative(ROOT, filePath);        // weeks/week-01/hovi.md
-    const author = basename(filePath, '.md');          // hovi
-    const week = basename(dirname(filePath));          // week-01
-    const content = readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n');
-
-    // ## 헤더 위치 찾기
-    const h2Indices = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (/^## /.test(lines[i])) h2Indices.push(i);
-    }
-
-    for (const idx of h2Indices) {
-      // ## 제목 추출
-      const title = lines[idx].replace(/^## /, '').trim();
-      // 바로 아래 줄에서 메타 파싱 (카테고리 1줄)
-      const metaLines = lines.slice(idx + 1, idx + 2);
-      const meta = parseMeta(metaLines);
-
-      questions.push({
-        title,
-        category: meta.category || '기타',
-        author,
-        week,
-        filePath: relPath,
-        anchor: toAnchor(title),
-      });
-    }
+    const parsed = parseQuestions(filePath);
+    allQuestions.push(...parsed);
   }
 
   // ── 카테고리별 그룹핑 ────────────────────────────────────
   const byCategory = new Map();
   for (const cat of CATEGORIES) byCategory.set(cat, []);
 
-  for (const q of questions) {
+  for (const q of allQuestions) {
     const cat = CATEGORIES.includes(q.category) ? q.category : '기타';
     byCategory.get(cat).push(q);
   }
 
-  // ── 중복 묶기 + 정렬 ────────────────────────────────────
+  // ── 중복 묶기 + 정렬 + 토글 생성 ────────────────────────
   const tocLines = [];
   let uniqueCount = 0;
-  let totalCount = 0;
 
   for (const cat of CATEGORIES) {
     const items = byCategory.get(cat);
     if (items.length === 0) continue;
 
-    // 정규화 키로 그룹핑
+    // 정규화 키로 그룹핑 (같은 질문은 첫 번째 답변만 사용)
     const groups = new Map();
     for (const q of items) {
       const key = normalize(q.title);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(q);
+      if (!groups.has(key)) groups.set(key, q);
     }
 
-    // 한글 가나다순 정렬 (대표 질문 제목 기준)
-    const sortedGroups = [...groups.entries()].sort((a, b) =>
-      a[1][0].title.localeCompare(b[1][0].title, 'ko')
+    // 한글 가나다순 정렬
+    const sorted = [...groups.values()].sort((a, b) =>
+      a.title.localeCompare(b.title, 'ko')
     );
 
-    tocLines.push(`### ${cat} (${sortedGroups.length})`);
+    tocLines.push(`### ${cat}`);
     tocLines.push('');
 
-    for (const [, group] of sortedGroups) {
+    for (const q of sorted) {
       uniqueCount++;
-      totalCount += group.length;
-
-      if (group.length === 1) {
-        // 단일 작성자 → 한 줄 링크
-        const q = group[0];
-        tocLines.push(
-          `- [${q.title}](${q.filePath}#${q.anchor}) — ${q.week} / ${q.author}`
-        );
-      } else {
-        // 복수 작성자 → 제목 볼드 + 서브리스트
-        const repr = group[0];
-        tocLines.push(`- **${repr.title}**`);
-        for (const q of group) {
-          tocLines.push(`  - [${q.week} / ${q.author}](${q.filePath}#${q.anchor})`);
-        }
-      }
+      tocLines.push(`<details>`);
+      tocLines.push(`<summary>${q.title}</summary>`);
+      tocLines.push('');
+      tocLines.push(q.body);
+      tocLines.push('');
+      tocLines.push(`</details>`);
+      tocLines.push('');
     }
-
-    tocLines.push('');
   }
 
   // ── 통계 헤더 ────────────────────────────────────────────
-  const now = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const now = new Date().toISOString().slice(0, 10);
   const statsHeader = [
-    `> **${uniqueCount}** 고유 질문 · **${totalCount}** 총 등장 · 마지막 업데이트: ${now}`,
+    `> **${uniqueCount}** 개 질문 · 마지막 업데이트: ${now}`,
     '',
   ];
 
@@ -169,7 +156,6 @@ function main() {
 
   // ── README 교체 ──────────────────────────────────────────
   const readme = readFileSync(README_PATH, 'utf-8');
-  // <!-- TOC:START --> 와 <!-- TOC:END --> 사이 영역만 교체
   const startMarker = '<!-- TOC:START -->';
   const endMarker = '<!-- TOC:END -->';
   const startIdx = readme.indexOf(startMarker);
@@ -185,7 +171,7 @@ function main() {
   const newReadme = `${before}\n${tocContent}\n${after}`;
 
   writeFileSync(README_PATH, newReadme, 'utf-8');
-  console.log(`README.md 갱신 완료! (고유 질문: ${uniqueCount}, 총 등장: ${totalCount})`);
+  console.log(`README.md 갱신 완료! (${uniqueCount}개 질문)`);
 }
 
 main();
